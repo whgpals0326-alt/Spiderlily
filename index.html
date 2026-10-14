@@ -1,0 +1,888 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f3eee2">
+<title>Red Spider Lily</title>
+<style>
+  :root{color-scheme:light;background:#f3eee2}
+  *{box-sizing:border-box}
+  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#f3eee2}
+  body{font-family:Inter,Pretendard,"Noto Sans KR",system-ui,sans-serif}
+  #canvas-container{position:fixed;inset:0;width:100vw;height:100vh;height:100dvh;min-height:100svh;overflow:hidden;z-index:9999;background:radial-gradient(ellipse at 53% 44%,rgba(255,252,244,.96),rgba(243,238,226,.9) 70%);isolation:isolate}
+  @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<div id="canvas-container">
+</div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script>
+/*
+ * RED SPIDER LILY — Three.js renderer + hand-gesture bloom
+ * Integration: replace the old flower-rendering <script> with this script.
+ * Requirements: global THREE (Three.js r150+ recommended) and #canvas-container.
+ * Webcam tracking loads MediaPipe Hands on demand from jsDelivr; slider works offline.
+ */
+(() => {
+  const container = document.getElementById('canvas-container');
+  if (!container) {
+    console.error('[Spider Lily] #canvas-container not found.');
+    return;
+  }
+  if (!window.THREE) {
+    console.error('[Spider Lily] Three.js must be loaded before this renderer.');
+    return;
+  }
+
+  const THREE = window.THREE;
+  const clamp = (v, min = 0, max = 1) => Math.max(min, Math.min(max, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const smoothstep = (a, b, x) => {
+    const t = clamp((x - a) / (b - a));
+    return t * t * (3 - 2 * t);
+  };
+  const dist2 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+  // Keep a pre-existing site's container and surrounding UI intact.
+  const originalContainerStyle = container.getAttribute('style');
+  Object.assign(container.style, {
+    position: 'fixed', inset: '0', width: '100vw', height: '100dvh',
+    minHeight: '100svh', overflow: 'hidden', zIndex: '9999', margin: '0',
+    borderRadius: '0'
+  });
+
+  // Clean up a previous instance if this script is re-run in a hot reload.
+  if (container.__spiderLilyCleanup) container.__spiderLilyCleanup();
+
+  const style = document.createElement('style');
+  style.dataset.spiderLilyStyle = 'true';
+  style.textContent = `
+    .sl-hud{position:absolute;inset:0;z-index:8;pointer-events:none;color:#fff;font-family:Inter,'Pretendard','Noto Sans KR',system-ui,sans-serif}
+    .sl-controls{position:absolute;right:max(16px,env(safe-area-inset-right));bottom:calc(16px + env(safe-area-inset-bottom));display:flex;align-items:center;gap:12px;padding:10px 12px;background:rgba(27,12,16,.48);border:1px solid rgba(255,235,230,.24);border-radius:999px;backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);pointer-events:auto;box-shadow:0 8px 28px rgba(0,0,0,.18)}
+    .sl-button{border:1px solid rgba(255,240,236,.30);background:rgba(164,31,36,.88);color:#fff8f2;border-radius:999px;font:inherit;font-size:12px;font-weight:650;line-height:1;padding:12px 15px;cursor:pointer;white-space:nowrap;min-width:88px;transition:background .2s,transform .2s}
+    .sl-button:hover{background:#b72b30;transform:translateY(-1px)}
+    .sl-button:disabled{opacity:.55;cursor:wait;transform:none}
+    .sl-bloom-control{display:flex;align-items:center;gap:9px;min-width:clamp(112px,18vw,220px)}
+    .sl-pct{font-variant-numeric:tabular-nums;font-size:11px;color:#fff0e8;font-weight:700;min-width:30px;text-align:right}
+    .sl-range{display:block;width:100%;margin:0;accent-color:#ff3040;cursor:pointer;min-width:80px}
+    .sl-camera{position:absolute;inset:0;width:100%;height:100%;height:100dvh;object-fit:cover;object-position:center;transform:scaleX(-1);display:none;border:0;border-radius:0;box-shadow:none;background:#101010;z-index:0}
+    .sl-landmarks{position:absolute;inset:0;width:100%;height:100%;display:block;transform:scaleX(-1);pointer-events:none;z-index:2}
+    @media(max-width:600px){.sl-controls{right:12px;bottom:calc(12px + env(safe-area-inset-bottom));gap:9px;padding:8px 9px}.sl-button{min-width:78px;padding:11px 12px;font-size:11px}.sl-bloom-control{min-width:104px;gap:6px}.sl-pct{font-size:10px;min-width:27px}}
+    @media(prefers-reduced-motion:reduce){.sl-button{transition:none}}
+  `;
+  container.appendChild(style);
+
+  const hud = document.createElement('div');
+  hud.className = 'sl-hud';
+  hud.innerHTML = `
+    <div class="sl-controls">
+      <button type="button" class="sl-button" data-sl-camera aria-label="카메라 시작">카메라 시작</button>
+      <div class="sl-bloom-control">
+        <span class="sl-pct" data-sl-pct>82%</span>
+        <input class="sl-range" data-sl-range type="range" min="0" max="100" value="82" aria-label="개화 정도">
+      </div>
+    </div>`;
+  container.appendChild(hud);
+
+  // The webcam and its tracking overlay are separate layers below the UI.
+  const video = document.createElement('video');
+  video.className = 'sl-camera';
+  video.setAttribute('playsinline', '');
+  video.setAttribute('muted', '');
+  video.muted = true;
+  container.appendChild(video);
+
+  const landmarkCanvas = document.createElement('canvas');
+  landmarkCanvas.className = 'sl-landmarks';
+  landmarkCanvas.setAttribute('aria-hidden', 'true');
+  container.appendChild(landmarkCanvas);
+  const landmarkCtx = landmarkCanvas.getContext('2d');
+
+  const slider = hud.querySelector('[data-sl-range]');
+  const pct = hud.querySelector('[data-sl-pct]');
+  const cameraButton = hud.querySelector('[data-sl-camera]');
+
+  function resizeHandOverlay() {
+    const width = Math.max(1, container.clientWidth || window.innerWidth);
+    const height = Math.max(1, container.clientHeight || window.innerHeight);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (landmarkCanvas.width !== Math.round(width * dpr) || landmarkCanvas.height !== Math.round(height * dpr)) {
+      landmarkCanvas.width = Math.round(width * dpr);
+      landmarkCanvas.height = Math.round(height * dpr);
+    }
+    landmarkCanvas.style.width = `${width}px`;
+    landmarkCanvas.style.height = `${height}px`;
+    landmarkCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    landmarkCtx.clearRect(0, 0, width, height);
+  }
+
+  function clearHandOverlay() {
+    landmarkCtx.clearRect(0, 0, landmarkCanvas.clientWidth || container.clientWidth, landmarkCanvas.clientHeight || container.clientHeight);
+  }
+
+  const handConnections = [
+    [0,1],[1,2],[2,3],[3,4],
+    [0,5],[5,6],[6,7],[7,8],
+    [5,9],[9,10],[10,11],[11,12],
+    [9,13],[13,14],[14,15],[15,16],
+    [13,17],[17,18],[18,19],[19,20],
+    [0,17]
+  ];
+  const fingertipIndices = new Set([4, 8, 12, 16, 20]);
+
+  function drawHandLandmarks(landmarks) {
+    resizeHandOverlay();
+    const width = container.clientWidth || window.innerWidth;
+    const height = container.clientHeight || window.innerHeight;
+    const vw = video.videoWidth || 640;
+    const vh = video.videoHeight || 480;
+    const scale = Math.max(width / vw, height / vh);
+    const offsetX = (width - vw * scale) / 2;
+    const offsetY = (height - vh * scale) / 2;
+    const points = landmarks.map((p) => ({
+      x: offsetX + p.x * vw * scale,
+      y: offsetY + p.y * vh * scale
+    }));
+
+    landmarkCtx.save();
+    landmarkCtx.lineCap = 'round';
+    landmarkCtx.lineJoin = 'round';
+    landmarkCtx.strokeStyle = '#ff243d';
+    landmarkCtx.lineWidth = Math.max(2, Math.min(3.2, width / 420));
+    landmarkCtx.shadowColor = 'rgba(255, 22, 48, .95)';
+    landmarkCtx.shadowBlur = 10;
+    handConnections.forEach(([a, b]) => {
+      landmarkCtx.beginPath();
+      landmarkCtx.moveTo(points[a].x, points[a].y);
+      landmarkCtx.lineTo(points[b].x, points[b].y);
+      landmarkCtx.stroke();
+    });
+    points.forEach((p, index) => {
+      const radius = fingertipIndices.has(index) ? 5 : (index === 0 ? 4.2 : 3.3);
+      landmarkCtx.beginPath();
+      landmarkCtx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+      landmarkCtx.fillStyle = '#ff233d';
+      landmarkCtx.fill();
+      landmarkCtx.lineWidth = 1.35;
+      landmarkCtx.strokeStyle = 'rgba(255,245,239,.96)';
+      landmarkCtx.stroke();
+    });
+    landmarkCtx.restore();
+  }
+
+  resizeHandOverlay();
+
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 100);
+  camera.position.set(0, 0.10, 11.7);
+  camera.lookAt(0, -0.08, 0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setClearColor(0x000000, 0);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.15;
+  if ('outputColorSpace' in renderer && THREE.SRGBColorSpace) renderer.outputColorSpace = THREE.SRGBColorSpace;
+  else if ('outputEncoding' in renderer && THREE.sRGBEncoding) renderer.outputEncoding = THREE.sRGBEncoding;
+  renderer.domElement.style.cssText = 'display:block;width:100%;height:100%;position:absolute;inset:0;z-index:1;outline:none;';
+  renderer.domElement.setAttribute('aria-label', '3D red spider lily flower');
+  container.prepend(renderer.domElement);
+
+  scene.add(new THREE.HemisphereLight(0xfff7eb, 0x39141b, 1.7));
+  const key = new THREE.DirectionalLight(0xffeee1, 2.25);
+  key.position.set(3.5, 5.5, 8);
+  scene.add(key);
+  const redFill = new THREE.DirectionalLight(0xff473e, 1.12);
+  redFill.position.set(-5, 1.8, 4);
+  scene.add(redFill);
+  const rim = new THREE.DirectionalLight(0xff7461, 2.0);
+  rim.position.set(0, -2.5, -5);
+  scene.add(rim);
+  const softFill = new THREE.PointLight(0xffc6a1, 0.38, 18);
+  softFill.position.set(1, 2.3, 5);
+  scene.add(softFill);
+
+  const plant = new THREE.Group();
+  plant.position.set(0, 1.18, 0);
+  scene.add(plant);
+
+  const backgroundDustGeometry = new THREE.BufferGeometry();
+  const dustCount = 74;
+  const dustPositions = new Float32Array(dustCount * 3);
+  const dustSpeeds = new Float32Array(dustCount * 3);
+  let seed = 928374;
+  const random = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+  for (let i = 0; i < dustCount; i++) {
+    dustPositions[i * 3] = (random() - 0.5) * 9;
+    dustPositions[i * 3 + 1] = (random() - 0.5) * 8;
+    dustPositions[i * 3 + 2] = -1.8 + random() * 2.2;
+    dustSpeeds[i * 3] = (random() - 0.5) * 0.0015;
+    dustSpeeds[i * 3 + 1] = 0.0004 + random() * 0.0012;
+  }
+  backgroundDustGeometry.setAttribute('position', new THREE.BufferAttribute(dustPositions, 3));
+  const dust = new THREE.Points(backgroundDustGeometry, new THREE.PointsMaterial({ color: 0x9d6354, size: 0.018, transparent: true, opacity: 0.38, depthWrite: false }));
+  scene.add(dust);
+
+  // Pollen particles burst outward when the flower opens. The existing flower
+  // geometry, materials, lighting and background dust remain unchanged.
+  const pollenCount = 360;
+  const pollenPositions = new Float32Array(pollenCount * 3);
+  const pollenVelocities = new Float32Array(pollenCount * 3);
+  const pollenLives = new Float32Array(pollenCount);
+  const pollenDurations = new Float32Array(pollenCount);
+  const pollenAlphas = new Float32Array(pollenCount);
+  const pollenSizes = new Float32Array(pollenCount);
+  const pollenColors = new Float32Array(pollenCount * 3);
+  const pollenPalette = [
+    new THREE.Color('#ffd8a0'),
+    new THREE.Color('#ffb76b'),
+    new THREE.Color('#fff0c4'),
+    new THREE.Color('#f47a48'),
+    new THREE.Color('#ffd1d6')
+  ];
+  for (let i = 0; i < pollenCount; i++) {
+    pollenPositions[i * 3 + 1] = -100;
+    pollenLives[i] = -1;
+    pollenAlphas[i] = 0;
+    pollenSizes[i] = 0.11 + random() * 0.15;
+    const c = pollenPalette[Math.floor(random() * pollenPalette.length)];
+    pollenColors[i * 3] = c.r;
+    pollenColors[i * 3 + 1] = c.g;
+    pollenColors[i * 3 + 2] = c.b;
+  }
+  const pollenGeometry = new THREE.BufferGeometry();
+  pollenGeometry.setAttribute('position', new THREE.BufferAttribute(pollenPositions, 3).setUsage(THREE.DynamicDrawUsage));
+  pollenGeometry.setAttribute('aAlpha', new THREE.BufferAttribute(pollenAlphas, 1).setUsage(THREE.DynamicDrawUsage));
+  pollenGeometry.setAttribute('aSize', new THREE.BufferAttribute(pollenSizes, 1));
+  pollenGeometry.setAttribute('color', new THREE.BufferAttribute(pollenColors, 3));
+  const pollenMaterial = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    uniforms: { uPixelRatio: { value: Math.min(window.devicePixelRatio || 1, 2) } },
+    vertexShader: `
+      uniform float uPixelRatio;
+      attribute float aAlpha;
+      attribute float aSize;
+      varying float vAlpha;
+      varying vec3 vColor;
+      void main() {
+        vAlpha = aAlpha;
+        vColor = color;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+        gl_PointSize = max(1.0, aSize * uPixelRatio * (245.0 / max(1.0, -mvPosition.z)));
+      }
+    `,
+    fragmentShader: `
+      varying float vAlpha;
+      varying vec3 vColor;
+      void main() {
+        float d = length(gl_PointCoord - vec2(0.5));
+        float glow = 1.0 - smoothstep(0.12, 0.5, d);
+        gl_FragColor = vec4(vColor, vAlpha * glow);
+      }
+    `,
+    vertexColors: true
+  });
+  const pollen = new THREE.Points(pollenGeometry, pollenMaterial);
+  pollen.frustumCulled = false;
+  scene.add(pollen);
+  let pollenCursor = 0;
+  let pollenMeter = 0;
+  let previousPollenBloom = 0.82;
+
+  function burstPollen(intensity = 0.7) {
+    const amount = Math.round(28 + clamp(intensity) * 34);
+    const cx = plant.position.x;
+    const cy = plant.position.y + 0.04;
+    const cz = 0.28;
+    for (let n = 0; n < amount; n++) {
+      const i = pollenCursor++ % pollenCount;
+      const angle = random() * Math.PI * 2;
+      const verticalBias = (random() - 0.32) * 1.35;
+      const speed = (0.48 + random() * 1.75) * (0.72 + intensity * 0.68);
+      const radius = 0.12 + random() * 0.42;
+      pollenPositions[i * 3] = cx + Math.cos(angle) * radius;
+      pollenPositions[i * 3 + 1] = cy + Math.sin(angle) * radius;
+      pollenPositions[i * 3 + 2] = cz + (random() - 0.5) * 0.55;
+      pollenVelocities[i * 3] = Math.cos(angle) * speed + (random() - 0.5) * 0.5;
+      pollenVelocities[i * 3 + 1] = Math.sin(angle) * speed + verticalBias;
+      pollenVelocities[i * 3 + 2] = (random() - 0.5) * speed * 1.25;
+      pollenLives[i] = 0.85 + random() * 1.55;
+      pollenDurations[i] = pollenLives[i];
+      pollenSizes[i] = 0.09 + random() * 0.2;
+      pollenAlphas[i] = 0.92;
+      const c = pollenPalette[Math.floor(random() * pollenPalette.length)];
+      pollenColors[i * 3] = c.r;
+      pollenColors[i * 3 + 1] = c.g;
+      pollenColors[i * 3 + 2] = c.b;
+    }
+    pollenGeometry.attributes.position.needsUpdate = true;
+    pollenGeometry.attributes.aAlpha.needsUpdate = true;
+    pollenGeometry.attributes.aSize.needsUpdate = true;
+    pollenGeometry.attributes.color.needsUpdate = true;
+  }
+
+
+  // Stem: a subtle organic curve continuing below the viewport.
+  const stemCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(-0.09, -0.10, -0.27),
+    new THREE.Vector3(-0.22, -1.25, -0.20),
+    new THREE.Vector3(-0.18, -2.55, -0.16),
+    new THREE.Vector3(-0.08, -4.35, -0.20),
+    new THREE.Vector3(0.03, -5.20, -0.24)
+  ]);
+  const stem = new THREE.Mesh(
+    new THREE.TubeGeometry(stemCurve, 72, 0.075, 12, false),
+    new THREE.MeshStandardMaterial({ color: 0x1d2920, roughness: 0.8, metalness: 0.01 })
+  );
+  plant.add(stem);
+
+  // Small dark-red receptacle where all six tepals and filaments meet.
+  const receptacle = new THREE.Mesh(
+    new THREE.SphereGeometry(0.30, 32, 20),
+    new THREE.MeshStandardMaterial({ color: 0x451016, roughness: 0.48, metalness: 0.02 })
+  );
+  receptacle.position.set(0, 0.02, 0.16);
+  receptacle.scale.set(1.06, 0.8, 0.65);
+  plant.add(receptacle);
+  const receptacleGlow = new THREE.Mesh(
+    new THREE.SphereGeometry(0.19, 24, 16),
+    new THREE.MeshStandardMaterial({ color: 0x8c1c20, roughness: 0.34, emissive: 0x2b0507, emissiveIntensity: 0.22 })
+  );
+  receptacleGlow.position.set(0, 0.03, 0.31);
+  receptacleGlow.scale.set(1.12, 0.83, 0.55);
+  plant.add(receptacleGlow);
+
+  const petalPivots = [];
+  const petalMeshes = [];
+  const veinMeshes = [];
+  const colorBase = new THREE.Color(0x76121e);
+  const colorMid = new THREE.Color(0xe12b2a);
+  const colorTip = new THREE.Color(0xae1c27);
+  const colorLit = new THREE.Color(0xff5543);
+
+  // Snapshot the original vertices once. At full bloom, the deformation resolves
+  // to these exact coordinates so the existing flower appearance is preserved.
+  function cacheBloomGeometry(geometry, tStart = 0, tEnd = 1) {
+    geometry.userData.bloomBasePositions = new Float32Array(geometry.attributes.position.array);
+    geometry.userData.bloomTStart = tStart;
+    geometry.userData.bloomTEnd = tEnd;
+  }
+
+  // Animate the petal surface itself instead of rotating the petal around its root.
+  // The tip follows a soft curved sweep while the petal length grows/shrinks.
+  function deformBloomGeometry(geometry, bloomAmount, shape, curveBoost = 0) {
+    const positions = geometry.attributes.position;
+    const uvs = geometry.attributes.uv;
+    const base = geometry.userData.bloomBasePositions;
+    if (!base || !uvs) return;
+
+    const b = clamp(bloomAmount);
+    const widthScale = 0.20 + 0.80 * b;
+    const reachScale = 0.10 + 0.90 * b;
+    const arc = Math.sin(Math.PI * b) + curveBoost;
+    const tStart = geometry.userData.bloomTStart ?? 0;
+    const tEnd = geometry.userData.bloomTEnd ?? 1;
+
+    for (let i = 0; i < positions.count; i++) {
+      const k = i * 3;
+      const t = tStart + clamp(uvs.getY(i)) * (tEnd - tStart);
+      const t2 = t * t;
+      const baseX = base[k];
+      const baseY = base[k + 1];
+      const baseZ = base[k + 2];
+      const smoothTip = t2 * (0.72 + 0.28 * t);
+      const centerArch = Math.sin(Math.PI * t);
+
+      positions.setXYZ(
+        i,
+        baseX * widthScale + shape.curl * shape.length * 0.10 * arc * smoothTip,
+        baseY * reachScale + shape.length * 0.11 * arc * centerArch,
+        baseZ + shape.length * 0.055 * arc * centerArch
+      );
+    }
+    positions.needsUpdate = true;
+    geometry.computeVertexNormals();
+  }
+
+  // Stamens also bend and retract through their own vertices; their root angles
+  // stay fixed so they never swing around the flower as the hand closes.
+  function deformStamenGeometry(geometry, bloomAmount, shape) {
+    const positions = geometry.attributes.position;
+    const uvs = geometry.attributes.uv;
+    const base = geometry.userData.bloomBasePositions;
+    if (!base || !uvs) return;
+
+    const b = clamp(bloomAmount);
+    const reachScale = 0.10 + 0.90 * b;
+    const arc = Math.sin(Math.PI * b);
+
+    for (let i = 0; i < positions.count; i++) {
+      const k = i * 3;
+      const t = clamp(uvs.getY(i));
+      const baseX = base[k];
+      const baseY = base[k + 1];
+      const baseZ = base[k + 2];
+      const centerArch = Math.sin(Math.PI * t);
+      const smoothTip = t * t * (0.7 + 0.3 * t);
+
+      positions.setXYZ(
+        i,
+        baseX * reachScale + shape.side * shape.length * 0.075 * arc * smoothTip,
+        baseY * reachScale + shape.length * 0.12 * arc * centerArch,
+        baseZ + shape.length * 0.028 * arc * centerArch
+      );
+    }
+    positions.needsUpdate = true;
+    geometry.computeVertexNormals();
+  }
+
+  function petalPoint(t, u, length, maxWidth, curlSide, phase) {
+    const q = clamp((t - 0.735) / 0.265);
+    const curl = q * q;
+    const profile = 0.075 + 0.925 * Math.pow(Math.max(0, Math.sin(Math.PI * t)), 0.64);
+    const ripple = 1 + 0.095 * Math.sin(t * 43 + phase) + 0.035 * Math.sin(t * 83 + phase * 1.6);
+    const halfWidth = maxWidth * 0.5 * profile * ripple;
+    const x = u * halfWidth + curlSide * 0.46 * curl + 0.035 * Math.sin(t * 5.2 + phase) * t;
+    const y = length * (t - 0.155 * curl);
+    const edgeFold = u * u * (0.13 + 0.045 * Math.sin(t * 24 + phase));
+    const z = 0.13 * Math.sin(Math.PI * t) + edgeFold + 0.045 * Math.sin(t * 26 + phase) * t + 0.035 * Math.sin(u * Math.PI * 3 + t * 10 + phase);
+    return new THREE.Vector3(x, y, z);
+  }
+
+  function makePetalGeometry(length, width, curlSide, phase) {
+    const across = 16;
+    const along = 64;
+    const positions = [];
+    const colors = [];
+    const uvs = [];
+    const indices = [];
+    for (let j = 0; j <= along; j++) {
+      const t = j / along;
+      for (let i = 0; i <= across; i++) {
+        const u = (i / across) * 2 - 1;
+        const p = petalPoint(t, u, length, width, curlSide, phase);
+        positions.push(p.x, p.y, p.z);
+        uvs.push(i / across, t);
+        let c = new THREE.Color();
+        if (t < 0.18) c.copy(colorBase).lerp(colorMid, smoothstep(0, 0.18, t));
+        else if (t < 0.76) c.copy(colorMid).lerp(colorLit, 0.16 * Math.max(0, Math.cos(u * Math.PI * 1.15)));
+        else c.copy(colorMid).lerp(colorTip, smoothstep(0.76, 1, t) * 0.86);
+        const edgeShade = 1 - 0.13 * Math.pow(Math.abs(u), 1.7) + 0.035 * Math.sin(t * 29 + phase);
+        c.multiplyScalar(edgeShade);
+        colors.push(c.r, c.g, c.b);
+      }
+    }
+    const row = across + 1;
+    for (let j = 0; j < along; j++) {
+      for (let i = 0; i < across; i++) {
+        const a = j * row + i, b = a + row, c = a + 1, d = b + 1;
+        indices.push(a, c, b, c, d, b);
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+    g.setIndex(indices);
+    g.computeVertexNormals();
+    return g;
+  }
+
+  const petalOpenAngles = [0.02, Math.PI / 3 + 0.11, 2 * Math.PI / 3 - 0.12, Math.PI + 0.06, 4 * Math.PI / 3 - 0.08, 5 * Math.PI / 3 + 0.10];
+  const petalSpecs = [
+    { len: 2.45, width: 0.70, curl: -1, tilt: -0.14 },
+    { len: 2.73, width: 0.62, curl:  1, tilt:  0.12 },
+    { len: 2.83, width: 0.56, curl: -1, tilt:  0.26 },
+    { len: 2.52, width: 0.69, curl:  1, tilt: -0.21 },
+    { len: 2.72, width: 0.61, curl: -1, tilt:  0.18 },
+    { len: 2.54, width: 0.67, curl:  1, tilt: -0.10 }
+  ];
+
+  petalSpecs.forEach((spec, i) => {
+    const pivot = new THREE.Group();
+    pivot.position.set(0, 0.02 + (i % 2) * 0.016, 0.08 + i * 0.006);
+    pivot.userData.closedAngle = -0.23 + i * 0.085; // retained for compatibility with host code
+    pivot.userData.openAngle = petalOpenAngles[i];
+    pivot.rotation.z = pivot.userData.openAngle;
+    const phase = i * 1.37 + 0.5;
+    const shape = { length: spec.len, width: spec.width, curl: spec.curl, phase };
+    const geometry = makePetalGeometry(spec.len, spec.width, spec.curl, phase);
+    cacheBloomGeometry(geometry);
+    const material = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      side: THREE.DoubleSide,
+      roughness: 0.42,
+      metalness: 0.025
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.rotation.x = spec.tilt;
+    mesh.rotation.y = (i % 2 ? 1 : -1) * 0.035;
+    mesh.userData.baseTilt = spec.tilt;
+    mesh.userData.pivot = pivot;
+    mesh.userData.bloomShape = shape;
+    pivot.userData.bounceAt = -Infinity;
+    pivot.add(mesh);
+    plant.add(pivot);
+    petalPivots.push(pivot);
+    petalMeshes.push(mesh);
+
+    // Thin satin vein catches the key light and reveals the ribbon-like curvature.
+    const points = [];
+    for (let k = 2; k <= 57; k++) points.push(petalPoint(k / 64, -0.08, spec.len, spec.width, spec.curl, i * 1.37 + 0.5).add(new THREE.Vector3(0, 0, 0.009)));
+    const veinCurve = new THREE.CatmullRomCurve3(points);
+    const veinGeometry = new THREE.TubeGeometry(veinCurve, 56, 0.0065, 5, false);
+    // The line follows the exact same curve as its petal during opening/closing.
+    cacheBloomGeometry(veinGeometry, 2 / 64, 57 / 64);
+    const vein = new THREE.Mesh(
+      veinGeometry,
+      new THREE.MeshBasicMaterial({ color: 0xff6856, transparent: true, opacity: 0.48, depthWrite: false })
+    );
+    vein.userData.bloomShape = shape;
+    mesh.userData.veinMesh = vein;
+    mesh.add(vein);
+    veinMeshes.push(vein);
+  });
+
+  // Clicking a tepal keeps the original mission-modal interaction intact.
+  const petalRaycaster = new THREE.Raycaster();
+  const petalPointer = new THREE.Vector2(-999, -999);
+  renderer.domElement.style.cursor = 'pointer';
+  renderer.domElement.addEventListener('pointermove', event => {
+    const rect = renderer.domElement.getBoundingClientRect();
+    petalPointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    petalPointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  }, { passive: true });
+  renderer.domElement.addEventListener('click', event => {
+    if (event.target.closest && (event.target.closest('#missionModal') || event.target.closest('#galleryDrawer'))) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    petalPointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    petalPointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    petalRaycaster.setFromCamera(petalPointer, camera);
+    const hits = petalRaycaster.intersectObjects(petalMeshes, false);
+    if (!hits.length) return;
+    const pivot = hits[0].object.userData.pivot;
+    if (pivot) pivot.userData.bounceAt = performance.now();
+    if (typeof window.openRandomMissionModal === 'function') window.openRandomMissionModal();
+  });
+
+  // Six long filaments, each with a dark oval anther.
+  const stamenPivots = [];
+  const stamenOpenAngles = [-2.13, -1.43, -0.66, 0.58, 1.34, 2.12];
+  const stamenHeights = [3.22, 3.42, 2.90, 3.15, 3.46, 2.78];
+  for (let i = 0; i < 6; i++) {
+    const root = new THREE.Group();
+    root.position.set((i - 2.5) * 0.022, 0.02, 0.27 + (i % 3) * 0.018);
+    root.userData.closedAngle = -0.17 + i * 0.07; // retained for compatibility with host code
+    root.userData.openAngle = stamenOpenAngles[i];
+    root.rotation.z = root.userData.openAngle;
+    const h = stamenHeights[i];
+    const side = i % 2 === 0 ? 1 : -1;
+    root.userData.bloomShape = { length: h, side };
+    const curve = new THREE.CatmullRomCurve3([
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(side * 0.16, h * 0.32, 0.025),
+      new THREE.Vector3(side * 0.44, h * 0.62, 0.10),
+      new THREE.Vector3(side * 0.52, h * 0.85, 0.14),
+      new THREE.Vector3(side * 0.42, h * 0.99, 0.17)
+    ]);
+    const filamentGeometry = new THREE.TubeGeometry(curve, 44, 0.018, 8, false);
+    cacheBloomGeometry(filamentGeometry);
+    const filament = new THREE.Mesh(
+      filamentGeometry,
+      new THREE.MeshStandardMaterial({ color: 0x56151a, roughness: 0.39, metalness: 0.02 })
+    );
+    root.add(filament);
+    const anther = new THREE.Mesh(
+      new THREE.SphereGeometry(0.052, 12, 9),
+      new THREE.MeshStandardMaterial({ color: 0x211b18, roughness: 0.5 })
+    );
+    anther.position.set(side * 0.42, h * 0.99, 0.17);
+    anther.scale.set(0.58, 1.55, 0.65);
+    root.userData.filament = filament;
+    root.userData.anther = anther;
+    root.userData.antherBasePosition = anther.position.clone();
+    root.add(anther);
+    plant.add(root);
+    stamenPivots.push(root);
+  }
+
+  // Bloom signal comes from the tracked hand pose or the compact fallback slider.
+  let bloom = 0.82;
+  let targetBloom = 0.82;
+  let cameraRunner = null;
+  let cameraStream = null;
+  let trackingOn = false;
+  let handLostFrames = 0;
+
+  slider.addEventListener('input', () => {
+    targetBloom = Number(slider.value) / 100;
+    pct.textContent = `${slider.value}%`;
+  });
+
+  function loadScriptOnce(src, key) {
+    const previous = document.querySelector(`script[data-sl-lib="${key}"]`);
+    if (previous && previous.dataset.failed === 'yes') previous.remove();
+    const existingScript = document.querySelector(`script[data-sl-lib="${key}"]`);
+    if (existingScript) {
+      return new Promise((resolve, reject) => {
+        if (existingScript.dataset.loaded === 'yes') resolve();
+        else {
+          existingScript.addEventListener('load', resolve, { once: true });
+          existingScript.addEventListener('error', reject, { once: true });
+        }
+      });
+    }
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = src;
+      script.async = true;
+      script.dataset.slLib = key;
+      script.onload = () => { script.dataset.loaded = 'yes'; resolve(); };
+      script.onerror = () => { script.dataset.failed = 'yes'; reject(new Error(`라이브러리 로드 실패: ${key}`)); };
+      document.head.appendChild(script);
+    });
+  }
+
+  async function startHandTracking() {
+    if (trackingOn) {
+      if (cameraRunner && typeof cameraRunner.stop === 'function') cameraRunner.stop();
+      if (cameraStream) cameraStream.getTracks().forEach(track => track.stop());
+      cameraStream = null;
+      trackingOn = false;
+      video.pause();
+      video.srcObject = null;
+      video.style.display = 'none';
+      clearHandOverlay();
+      cameraButton.textContent = '카메라 시작';
+      cameraButton.setAttribute('aria-label', '카메라 시작');
+      slider.disabled = false;
+      if (document.fullscreenElement === container && document.exitFullscreen) {
+        document.exitFullscreen().catch(() => {});
+      }
+      return;
+    }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      console.warn('[Spider Lily] Camera requires HTTPS or localhost.');
+      return;
+    }
+
+    // Request full-screen while the user's click activation is still available.
+    if (!document.fullscreenElement && container.requestFullscreen) {
+      try {
+        const fullscreenRequest = container.requestFullscreen({ navigationUI: 'hide' });
+        if (fullscreenRequest && typeof fullscreenRequest.catch === 'function') fullscreenRequest.catch(() => {});
+      } catch (_) {}
+    }
+
+    cameraButton.disabled = true;
+    try {
+      await loadScriptOnce('https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js', 'hands');
+      await loadScriptOnce('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js', 'camera-utils');
+      if (!window.Hands || !window.Camera) throw new Error('MediaPipe initialization failed.');
+
+      const hands = new window.Hands({
+        locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+      });
+      hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.58,
+        minTrackingConfidence: 0.52
+      });
+      hands.onResults(results => {
+        const landmarks = results.multiHandLandmarks && results.multiHandLandmarks[0];
+        if (!landmarks) {
+          handLostFrames++;
+          if (handLostFrames > 5) clearHandOverlay();
+          return;
+        }
+        handLostFrames = 0;
+        drawHandLandmarks(landmarks);
+
+        const wrist = landmarks[0];
+        const pairs = [[8, 6], [12, 10], [16, 14], [20, 18]];
+        const ratios = pairs.map(([tip, pip]) => {
+          const denominator = Math.max(0.025, dist2(landmarks[pip], wrist));
+          return dist2(landmarks[tip], wrist) / denominator;
+        });
+        const avg = ratios.reduce((sum, value) => sum + value, 0) / ratios.length;
+        const extended = ratios.filter(value => value > 1.18).length / ratios.length;
+        const openness = 0.58 * smoothstep(1.00, 1.43, avg) + 0.42 * extended;
+        targetBloom = clamp(openness);
+        slider.value = String(Math.round(targetBloom * 100));
+        pct.textContent = `${slider.value}%`;
+      });
+
+      video.style.display = 'block';
+      cameraRunner = new window.Camera(video, {
+        onFrame: async () => { await hands.send({ image: video }); },
+        width: 1280,
+        height: 720
+      });
+      await cameraRunner.start();
+      cameraStream = video.srcObject;
+      trackingOn = true;
+      slider.disabled = true;
+      cameraButton.textContent = '카메라 끄기';
+      cameraButton.setAttribute('aria-label', '카메라 끄기');
+      resizeHandOverlay();
+    } catch (error) {
+      console.error('[Spider Lily] hand tracking error:', error);
+      video.style.display = 'none';
+      clearHandOverlay();
+      cameraButton.textContent = '다시 시작';
+      slider.disabled = false;
+    } finally {
+      cameraButton.disabled = false;
+    }
+  }
+  cameraButton.addEventListener('click', startHandTracking);
+
+  let raf = 0;
+  let previousTime = 0;
+  function resize() {
+    const width = Math.max(1, container.clientWidth || window.innerWidth);
+    const height = Math.max(1, container.clientHeight || window.innerHeight);
+    camera.aspect = width / height;
+    // Keep the radial bloom readable on narrow screens.
+    const fov = THREE.MathUtils.degToRad(camera.fov);
+    const desiredWidth = 7.35;
+    const distanceForWidth = desiredWidth / (2 * Math.tan(fov / 2) * camera.aspect);
+    const distanceForHeight = 8.05 / (2 * Math.tan(fov / 2));
+    camera.position.z = clamp(Math.max(distanceForWidth, distanceForHeight), 10.2, 23.5);
+    camera.lookAt(0, -0.12, 0);
+    camera.updateProjectionMatrix();
+    renderer.setSize(width, height, false);
+    resizeHandOverlay();
+    if (pollenMaterial.uniforms.uPixelRatio) pollenMaterial.uniforms.uPixelRatio.value = Math.min(window.devicePixelRatio || 1, 2);
+  }
+  const resizeObserver = new ResizeObserver(resize);
+  resizeObserver.observe(container);
+  window.addEventListener('resize', resize, { passive: true });
+  resize();
+
+  function animate(now) {
+    raf = requestAnimationFrame(animate);
+    const dt = previousTime ? Math.min(0.05, (now - previousTime) / 1000) : 0.016;
+    previousTime = now;
+    bloom += (targetBloom - bloom) * (1 - Math.exp(-dt * 3.7));
+    const b = smoothstep(0, 1, bloom);
+
+    // Accumulate outward opening motion and emit several pollen bursts.
+    const bloomGrowth = Math.max(0, b - previousPollenBloom);
+    pollenMeter += bloomGrowth;
+    if (pollenMeter >= 0.13 && b > 0.22) {
+      const burstStrength = clamp(0.38 + pollenMeter * 2.3);
+      burstPollen(burstStrength);
+      pollenMeter = Math.max(0, pollenMeter - 0.13);
+    }
+    if (b < 0.16) pollenMeter = 0;
+    previousPollenBloom = b;
+
+    petalPivots.forEach((pivot, i) => {
+      const mesh = petalMeshes[i];
+      const elapsedSinceBounce = now - (pivot.userData.bounceAt ?? -Infinity);
+      const bounce = elapsedSinceBounce >= 0 && elapsedSinceBounce < 900
+        ? Math.sin(elapsedSinceBounce / 900 * Math.PI * 5) * Math.exp(-elapsedSinceBounce / 270) * 0.10
+        : 0;
+
+      // The pivot stays at its open radial angle. Only the petal vertices flex,
+      // so the tip traces a curved path outward/inward rather than swinging.
+      pivot.rotation.z = pivot.userData.openAngle;
+      mesh.scale.set(1, 1, 1);
+      deformBloomGeometry(mesh.geometry, clamp(b + Math.max(0, bounce) * 0.35), mesh.userData.bloomShape, bounce);
+      if (mesh.userData.veinMesh) {
+        deformBloomGeometry(
+          mesh.userData.veinMesh.geometry,
+          clamp(b + Math.max(0, bounce) * 0.35),
+          mesh.userData.veinMesh.userData.bloomShape,
+          bounce
+        );
+      }
+      mesh.rotation.x = mesh.userData.baseTilt + Math.sin(now * 0.0008 + i * 1.3) * 0.012;
+    });
+
+    stamenPivots.forEach((root, i) => {
+      // Keep each filament's radial direction fixed; curve and retract its mesh.
+      root.rotation.z = root.userData.openAngle;
+      root.scale.set(1, 1, 1);
+      const shape = root.userData.bloomShape;
+      deformStamenGeometry(root.userData.filament.geometry, b, shape);
+
+      const tip = root.userData.antherBasePosition;
+      const reach = 0.10 + 0.90 * b;
+      const arc = Math.sin(Math.PI * b);
+      root.userData.anther.position.set(
+        tip.x * reach + shape.side * shape.length * 0.075 * arc,
+        tip.y * reach,
+        tip.z
+      );
+      root.rotation.x = Math.sin(now * 0.0007 + i) * 0.012;
+    });
+    plant.rotation.y = Math.sin(now * 0.00026) * 0.035;
+    plant.rotation.x = Math.sin(now * 0.00031) * 0.018;
+    plant.position.y = 1.18 + Math.sin(now * 0.00065) * 0.025;
+    receptacleGlow.material.emissiveIntensity = 0.15 + b * 0.13;
+
+    const p = backgroundDustGeometry.attributes.position.array;
+    for (let i = 0; i < dustCount; i++) {
+      p[i * 3] += dustSpeeds[i * 3];
+      p[i * 3 + 1] += dustSpeeds[i * 3 + 1];
+      if (p[i * 3 + 1] > 4.5) p[i * 3 + 1] = -4.5;
+      if (p[i * 3] > 4.8) p[i * 3] = -4.8;
+      if (p[i * 3] < -4.8) p[i * 3] = 4.8;
+    }
+    backgroundDustGeometry.attributes.position.needsUpdate = true;
+
+    // Warm pollen flecks drift outward, float briefly, then fade away.
+    for (let i = 0; i < pollenCount; i++) {
+      if (pollenLives[i] <= 0) { pollenAlphas[i] = 0; continue; }
+      pollenLives[i] -= dt;
+      const k = i * 3;
+      pollenPositions[k] += pollenVelocities[k] * dt;
+      pollenPositions[k + 1] += pollenVelocities[k + 1] * dt;
+      pollenPositions[k + 2] += pollenVelocities[k + 2] * dt;
+      pollenVelocities[k] *= Math.exp(-0.52 * dt);
+      pollenVelocities[k + 1] = pollenVelocities[k + 1] * Math.exp(-0.35 * dt) + 0.10 * dt;
+      pollenVelocities[k + 2] *= Math.exp(-0.44 * dt);
+      const lifeRatio = clamp(pollenLives[i] / pollenDurations[i]);
+      pollenAlphas[i] = Math.min(1, (1 - lifeRatio) * 8) * Math.pow(lifeRatio, 0.72) * 0.92;
+    }
+    pollenGeometry.attributes.position.needsUpdate = true;
+    pollenGeometry.attributes.aAlpha.needsUpdate = true;
+    renderer.render(scene, camera);
+  }
+  raf = requestAnimationFrame(animate);
+
+  container.__spiderLilyCleanup = () => {
+    cancelAnimationFrame(raf);
+    resizeObserver.disconnect();
+    window.removeEventListener('resize', resize);
+    if (cameraRunner && typeof cameraRunner.stop === 'function') cameraRunner.stop();
+    if (cameraStream) cameraStream.getTracks().forEach(track => track.stop());
+    clearHandOverlay();
+    renderer.dispose();
+    pollenGeometry.dispose();
+    pollenMaterial.dispose();
+    hud.remove();
+    video.remove();
+    landmarkCanvas.remove();
+    style.remove();
+    renderer.domElement.remove();
+    if (originalContainerStyle === null) container.removeAttribute('style');
+    else container.setAttribute('style', originalContainerStyle);
+  };
+})();
+</script>
+</body>
+</html>
